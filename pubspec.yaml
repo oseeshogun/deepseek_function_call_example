@@ -1,5 +1,6 @@
 name: deepseek_function_call_example
-description: "A new Flutter project."
+description: "Flutter demo of DeepSeek function calling: web search and Google Calendar, with user confirmation before writes."
+repository: https://github.com/oseeshogun/deepseek_function_call_example
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -37,7 +38,9 @@ dependencies:
   get_it: ^9.3.0
   injectable: ^3.0.0
   flutter_deepseek:
-    path: ../flutter_deepseek
+    git:
+      url: https://github.com/oseeshogun/flutter_deepseek.git
+      ref: main
   bloc: ^9.2.1
   flutter_bloc: ^9.1.1
   flutter_markdown_plus: ^1.0.12

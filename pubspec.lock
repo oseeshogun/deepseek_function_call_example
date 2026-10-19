@@ -217,10 +217,12 @@ packages:
   flutter_deepseek:
     dependency: "direct main"
     description:
-      path: "../flutter_deepseek"
-      relative: true
-    source: path
-    version: "0.1.1"
+      path: "."
+      ref: main
+      resolved-ref: "51305af955b0a0c02ca19e495ce4715914203645"
+      url: "https://github.com/oseeshogun/flutter_deepseek.git"
+    source: git
+    version: "0.1.2"
   flutter_lints:
     dependency: "direct dev"
     description:
