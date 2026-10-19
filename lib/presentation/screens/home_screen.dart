@@ -2,13 +2,19 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:deepseek_function_call_example/core/config/locator.dart';
+import 'package:deepseek_function_call_example/features/calendar/calendar_auth.dart';
+import 'package:deepseek_function_call_example/features/calendar/calendar_tool_executor.dart';
+import 'package:deepseek_function_call_example/features/calendar/google_calendar_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_deepseek/flutter_deepseek.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  const HomeScreen({super.key, this.promptCalendarLink = true});
+
+  /// Offers to link Google Calendar at launch when it is not linked yet.
+  final bool promptCalendarLink;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -16,6 +22,8 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final _client = locator<DeepSeekClient>();
+  final _calendarAuth = locator<CalendarAuth>();
+  final _calendar = locator<GoogleCalendarService>();
   final _controller = TextEditingController();
 
   /// Full conversation as sent to the API, including tool-call messages.
@@ -24,6 +32,10 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription<void>? _subscription;
   bool _isBusy = false;
   bool _searchEnabled = false;
+  bool _calendarEnabled = false;
+
+  /// Whether the running turn goes through the tool-calling loop.
+  bool _usesTools = false;
   String? _status;
   String? _error;
 
@@ -35,6 +47,24 @@ class _HomeScreenState extends State<HomeScreen> {
             (m.toolCalls == null || m.toolCalls!.isEmpty),
       )
       .toList();
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreCalendar();
+  }
+
+  Future<void> _restoreCalendar() async {
+    try {
+      final linked = await _calendarAuth.restore();
+      if (mounted && linked) setState(() => _calendarEnabled = true);
+    } catch (_) {
+      // Not linked yet, or Google sign-in is not configured: stay unlinked.
+    }
+    if (mounted && widget.promptCalendarLink && !_calendarAuth.isLinked) {
+      await _showCalendarDialog();
+    }
+  }
 
   @override
   void dispose() {
@@ -55,8 +85,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _history.add(ChatMessage.user(text));
     });
 
-    if (_searchEnabled) {
-      _chatWithSearch();
+    _usesTools = _searchEnabled || _calendarEnabled;
+    if (_usesTools) {
+      _chatWithTools();
     } else {
       _chatStreaming();
     }
@@ -90,12 +121,17 @@ class _HomeScreenState extends State<HomeScreen> {
         );
   }
 
-  /// Lets the model search the web, then shows its final answer.
-  void _chatWithSearch() {
+  /// Lets the model use the enabled tools, then shows its final answer.
+  void _chatWithTools() {
     _subscription = _client
         .chatWithTools(
           messages: List.of(_history),
-          executor: WebToolExecutor(_client),
+          systemPrompt: _systemPrompt(),
+          executor: CompositeToolExecutor([
+            if (_searchEnabled) WebToolExecutor(_client),
+            if (_calendarEnabled)
+              CalendarToolExecutor(_calendar, confirm: _confirmEvent),
+          ]),
         )
         .listen(
           (event) {
@@ -140,13 +176,127 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Tells the model what it cannot know: today's date and the user's zone.
+  String _systemPrompt() {
+    final now = DateTime.now();
+    final offset = now.timeZoneOffset;
+    final sign = offset.isNegative ? '-' : '+';
+    final hh = offset.inHours.abs().toString().padLeft(2, '0');
+    final mm = (offset.inMinutes.abs() % 60).toString().padLeft(2, '0');
+    return 'Current date and time: ${now.toIso8601String().split('.').first} '
+        '(${now.timeZoneName}, UTC$sign$hh:$mm). Resolve words like "today" '
+        'and "tomorrow" from it. Your knowledge has a cutoff: for recent '
+        'events, dates or facts you are unsure about, search the web instead '
+        'of assuming. Use the calendar tools for anything about the user\'s '
+        'schedule, and never claim an event was added unless the tool '
+        'returned status "created".';
+  }
+
   String _describe(ToolCall call) {
+    Map<String, dynamic> args = {};
     try {
-      final args = jsonDecode(call.function.arguments) as Map<String, dynamic>;
-      final query = args['query'];
-      if (query is String) return 'Searching the web: $query';
+      args = jsonDecode(call.function.arguments) as Map<String, dynamic>;
     } catch (_) {}
-    return 'Searching the web…';
+    switch (call.function.name) {
+      case DeepSeekTools.webSearchName:
+        final query = args['query'];
+        return query is String
+            ? 'Searching the web: $query'
+            : 'Searching the web…';
+      case CalendarToolExecutor.listEventsName:
+        return 'Reading your calendar…';
+      case CalendarToolExecutor.createEventName:
+        final title = args['title'];
+        return title is String
+            ? 'Adding to your calendar: $title'
+            : 'Adding to your calendar…';
+      default:
+        return 'Running ${call.function.name}…';
+    }
+  }
+
+  /// Asks the user to approve an event before the model may create it.
+  Future<bool> _confirmEvent(EventDraft draft) async {
+    if (!mounted) return false;
+    final loc = MaterialLocalizations.of(context);
+    String when(DateTime t) =>
+        '${loc.formatFullDate(t)}, ${loc.formatTimeOfDay(TimeOfDay.fromDateTime(t))}';
+    final approved = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Add this event to Google Calendar?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(draft.title, style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Text('From: ${when(draft.start.toLocal())}'),
+            Text('To: ${when(draft.end.toLocal())}'),
+            if (draft.location != null) Text('Where: ${draft.location}'),
+            if (draft.description != null) Text(draft.description!),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Refuse'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Add'),
+          ),
+        ],
+      ),
+    );
+    return approved ?? false;
+  }
+
+  /// Dialog to link or unlink the Google account.
+  Future<void> _showCalendarDialog() async {
+    final linked = _calendarAuth.isLinked;
+    final action = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Google Calendar'),
+        content: Text(
+          linked
+              ? 'Linked as ${_calendarAuth.email}.\n\nThe assistant can read '
+                    'your events and add new ones, but only after you approve '
+                    'each addition.'
+              : 'Link your Google account so the assistant can read your '
+                    'events and add new ones. Google will ask for your '
+                    'permission, and you approve each event before it is '
+                    'added.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: Text(linked ? 'Unlink' : 'Link account'),
+          ),
+        ],
+      ),
+    );
+    if (action != true || !mounted) return;
+
+    try {
+      if (linked) {
+        await _calendarAuth.unlink();
+      } else {
+        await _calendarAuth.link();
+      }
+      if (mounted) setState(() => _calendarEnabled = _calendarAuth.isLinked);
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Google sign-in failed: $error')));
+    }
   }
 
   @override
@@ -155,7 +305,16 @@ class _HomeScreenState extends State<HomeScreen> {
     final messages = _visibleMessages;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('AI Function Call Assistant')),
+      appBar: AppBar(
+        title: const Text('AI Function Call Assistant'),
+        actions: [
+          IconButton(
+            tooltip: 'Google Calendar settings',
+            icon: const Icon(Icons.manage_accounts_outlined),
+            onPressed: _isBusy ? null : _showCalendarDialog,
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Expanded(
@@ -206,7 +365,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     },
                   ),
           ),
-          if (_isBusy && _searchEnabled)
+          if (_isBusy && _usesTools)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12.0),
               child: Row(
@@ -261,6 +420,27 @@ class _HomeScreenState extends State<HomeScreen> {
                   onPressed: _isBusy
                       ? null
                       : () => setState(() => _searchEnabled = !_searchEnabled),
+                ),
+                IconButton.filledTonal(
+                  tooltip: !_calendarAuth.isLinked
+                      ? 'Link Google Calendar'
+                      : _calendarEnabled
+                      ? 'Calendar on'
+                      : 'Calendar off',
+                  isSelected: _calendarEnabled,
+                  icon: const Icon(Icons.calendar_month_outlined),
+                  selectedIcon: const Icon(Icons.calendar_month),
+                  onPressed: _isBusy
+                      ? null
+                      : () {
+                          if (_calendarAuth.isLinked) {
+                            setState(
+                              () => _calendarEnabled = !_calendarEnabled,
+                            );
+                          } else {
+                            _showCalendarDialog();
+                          }
+                        },
                 ),
               ],
             ),
